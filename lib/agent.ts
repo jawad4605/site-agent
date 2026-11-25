@@ -49,6 +49,11 @@ Design rules:
 
 ${ANTI_GENERIC}`;
 
+// Short version of the instructions for models with small token budgets (Groq free: 8K tokens/min).
+export const LEAN_PROMPT = `You are an autonomous web developer agent: build a beautiful, complete website, check it, fix it, publish it.
+Steps: plan briefly (follow the ART DIRECTION) → write_page "index.html" → check_site → fix real problems with small edit_page calls → publish_site → reply in one sentence. For change requests, change only what was asked, then check and publish again.
+Rules: full HTML document per page with inline CSS/JS, under 14 KB. Mobile-first and responsive. Sticky header (position:sticky;top:0;z-index:50) with a hamburger menu on mobile. Relative links only (never href="/"). Every button goes to a real #id, page, tel:, mailto: or https://wa.me/ link. Real copy, no lorem ipsum. Use search_images for photos (object-fit:cover). No purple gradients, glassmorphism, emoji icons or "Welcome to X" heroes: commit to the art direction's fonts and palette.`;
+
 const PAGE = { type: "string", description: 'Page file name, e.g. "index.html" or "menu.html"' };
 
 export const TOOLS: Anthropic.Tool[] = [
@@ -111,7 +116,7 @@ export type AgentEvent =
   | { type: "direction"; name: string };
 
 export type Files = Record<string, string>;
-export type StepInput = { messages: Anthropic.MessageParam[]; files: Files; siteId?: string; origin: string; brain?: Brain };
+export type StepInput = { messages: Anthropic.MessageParam[]; files: Files; siteId?: string; origin: string; brain?: Brain | Brain[] };
 export type StepOutput = {
   messages: Anthropic.MessageParam[];
   files: Files;
@@ -254,7 +259,7 @@ function salvageHtml(content: any[]): any[] {
 }
 
 // Plan B for writing the page: one plain request ("reply with the HTML"), no tools.
-async function writeHtmlDirectly(history: Anthropic.MessageParam[], brain?: Brain): Promise<string> {
+async function writeHtmlDirectly(history: Anthropic.MessageParam[], brain?: Brain | Brain[]): Promise<string> {
   const firstUser = history.find((m) => m.role === "user" && typeof m.content === "string");
   const request = String(firstUser?.content ?? "").replace(/^\[continue\].*$/gm, "");
   const toolText = JSON.stringify(history);
@@ -264,7 +269,7 @@ async function writeHtmlDirectly(history: Anthropic.MessageParam[], brain?: Brai
     (images.length ? `Verified photo URLs you can use:\n${images.map((u) => "- " + u).join("\n")}\n\n` : "") +
     "Write the COMPLETE index.html for this website now: one file with inline CSS and JS, following the art direction. " +
     "Reply with ONLY the code inside one ```html code block. Keep it under 30 KB.";
-  const res = await callModel(SYSTEM_PROMPT, [], [{ role: "user", content: prompt }], {}, brain);
+  const res = await callModel(SYSTEM_PROMPT, [], [{ role: "user", content: prompt }], {}, brain, LEAN_PROMPT);
   const blocks = salvageHtml(res.content as any[]);
   if (blocks.length) return blocks[0].input.html as string;
   const raw = (res.content as any[]).filter((b) => b.type === "text").map((b) => b.text).join("\n");
@@ -291,7 +296,7 @@ export async function runStep({ messages, files, siteId, origin, brain }: StepIn
   // 1. THINK — ask the model what to do next
   const response = process.env.MOCK_LLM
     ? { ...mockModel(history), provider: "Mock model (test mode)", fallbackReason: undefined }
-    : await callModel(SYSTEM_PROMPT, TOOLS, history, files, brain);
+    : await callModel(SYSTEM_PROMPT, TOOLS, history, files, brain, LEAN_PROMPT);
   if (response.fallbackReason) events.push({ type: "fallback", text: response.fallbackReason });
 
   for (const block of response.content as any[]) {

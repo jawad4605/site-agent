@@ -232,6 +232,11 @@ export default function Home() {
     const key = settings.keys[settings.brain];
     return key ? { provider: settings.brain, key, model: settings.models[settings.brain] || undefined } : undefined;
   }
+  // Every key the student connected (Groq, Gemini…) is used automatically, before the server's shared keys.
+  function ownKeys() {
+    const picked = brainForRequest()?.provider;
+    return PROVIDERS.filter((p) => settings.keys[p.id] && p.id !== picked).map((p) => ({ provider: p.id, key: settings.keys[p.id]!, model: settings.models[p.id] || undefined }));
+  }
   const siteName = () => (convo.current.siteId || "my-site").replace(/-[a-z0-9]{4}$/, "");
 
   async function pushToGithub(): Promise<string | null> {
@@ -425,7 +430,7 @@ export default function Home() {
         const res = await fetch("/api/agent", {
           method: "POST",
           headers: { "content-type": "application/json" },
-          body: JSON.stringify({ ...convo.current, brain: brainForRequest(), style }),
+          body: JSON.stringify({ ...convo.current, brain: brainForRequest(), brains: ownKeys(), style }),
         });
         const data = await res.json().catch(() => ({ error: `Server error (${res.status})` }));
         if (!res.ok || data.error) {
@@ -924,6 +929,7 @@ export default function Home() {
             connect("github");
           }}
           onSave={(s) => { saveSettings(s); setShowSettings(false); }}
+          onKeysChange={(keys) => saveSettings({ ...settings, keys })}
           onClose={() => setShowSettings(false)}
         />
       )}

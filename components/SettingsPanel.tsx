@@ -4,7 +4,7 @@ import { EMPTY_SETTINGS, OR_MODELS, PROVIDERS, type Conns, type ProviderId, type
 import { Icon } from "./icons";
 
 export default function SettingsPanel({
-  settings, conns, onConnect, onDisconnect, onSaveVercelToken, onGithubAppSaved, onSave, onClose,
+  settings, conns, onConnect, onDisconnect, onSaveVercelToken, onGithubAppSaved, onSave, onKeysChange, onClose,
 }: {
   settings: Settings;
   conns: Conns;
@@ -13,6 +13,7 @@ export default function SettingsPanel({
   onSaveVercelToken: (token: string) => void;
   onGithubAppSaved: () => void;
   onSave: (s: Settings) => void;
+  onKeysChange?: (keys: Settings["keys"]) => void;
   onClose: () => void;
 }) {
   const [s, setS] = useState<Settings>(settings);
@@ -28,6 +29,12 @@ export default function SettingsPanel({
           <h2>Connections</h2>
           <button className="ghost small" onClick={onClose}>✕</button>
         </div>
+
+        {/* ── Free AI keys: two clicks each ── */}
+        <FreeKeys
+          keys={s.keys}
+          onChange={(keys) => { setS({ ...s, keys }); onKeysChange?.(keys); }}
+        />
 
         {/* ── AI ───────────────────────────── */}
         <div className="card">
@@ -196,6 +203,115 @@ function GithubSetup({ onSaved }: { onSaved: () => void }) {
           {err && <p className="err small">{err}</p>}
           <button className="connect inline" disabled={saving || !clientId || !secret} onClick={save}>{saving ? "Saving…" : "Save & connect GitHub"}</button>
         </div>
+      </div>
+    </div>
+  );
+}
+
+// ── Free AI keys ─────────────────────────────────────────────
+// Each student connects their OWN free keys, so 100 people never share one limit.
+// 1) "Get free key" opens the provider's key page  2) "Paste key" reads the clipboard, checks the key, saves it.
+const FREE = [
+  { id: "groq" as const, name: "Groq", logo: "G", color: "#F55036", url: "https://console.groq.com/keys", hint: "Create API Key → copy", models: "gpt-oss-120b · qwen3.8-27b · gpt-oss-20b" },
+  { id: "gemini" as const, name: "Google Gemini", logo: "✦", color: "#4285F4", url: "https://aistudio.google.com/apikey", hint: "Create API key → copy", models: "Gemini 3.5 Flash · 3.1 Flash-Lite" },
+];
+
+function FreeKeys({ keys, onChange }: { keys: Settings["keys"]; onChange: (k: Settings["keys"]) => void }) {
+  const [busy, setBusy] = useState<string | null>(null);
+  const [msg, setMsg] = useState<Record<string, { ok: boolean; text: string }>>({});
+  const [manual, setManual] = useState<Record<string, string>>({});
+  const [showManual, setShowManual] = useState<Record<string, boolean>>({});
+
+  async function save(id: "groq" | "gemini", raw: string) {
+    const key = raw.trim().replace(/^["']|["']$/g, "");
+    if (!key) return;
+    setBusy(id);
+    setMsg((m) => ({ ...m, [id]: { ok: true, text: "Checking key…" } }));
+    try {
+      const r = await fetch("/api/keycheck", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ provider: id, key }) });
+      const d = await r.json();
+      if (d.ok) {
+        onChange({ ...keys, [id]: key });
+        setMsg((m) => ({ ...m, [id]: { ok: true, text: `Connected · ${d.models} models available` } }));
+        setShowManual((v) => ({ ...v, [id]: false }));
+        setManual((v) => ({ ...v, [id]: "" }));
+      } else setMsg((m) => ({ ...m, [id]: { ok: false, text: d.error } }));
+    } catch {
+      setMsg((m) => ({ ...m, [id]: { ok: false, text: "Couldn't check the key. Try again." } }));
+    }
+    setBusy(null);
+  }
+
+  async function paste(id: "groq" | "gemini") {
+    try {
+      const text = await navigator.clipboard.readText();
+      if (text?.trim()) return save(id, text);
+    } catch {}
+    // clipboard blocked (or empty): show a field instead
+    setShowManual((v) => ({ ...v, [id]: true }));
+    setMsg((m) => ({ ...m, [id]: { ok: false, text: "Paste the key in the box (Ctrl+V), then press Save." } }));
+  }
+
+  const remove = (id: "groq" | "gemini") => {
+    const next = { ...keys };
+    delete next[id];
+    onChange(next);
+    setMsg((m) => ({ ...m, [id]: { ok: true, text: "Removed." } }));
+  };
+
+  return (
+    <div className="card">
+      <div className="card-head">
+        <div className="logo-dot free">FREE</div>
+        <div>
+          <b>Free AI keys</b>
+          <div className="muted small">Takes 1 minute. Your own free limits, so you never wait for anyone else. Keys stay in this browser.</div>
+        </div>
+      </div>
+      <div className="free-keys">
+        {FREE.map((p, i) => {
+          const on = !!keys[p.id];
+          const m = msg[p.id];
+          return (
+            <div key={p.id} className={`free-key ${on ? "on" : ""}`}>
+              <div className="fk-top">
+                <span className="fk-logo" style={{ background: p.color }}>{p.logo}</span>
+                <div className="fk-name">
+                  <b>{p.name}</b>
+                  <span className="muted small">{p.models}</span>
+                </div>
+                {on ? (
+                  <span className="pill ok">● Connected</span>
+                ) : (
+                  <span className="pill warn">{i === 0 ? "Recommended" : "Backup"}</span>
+                )}
+              </div>
+              {on ? (
+                <div className="fk-actions">
+                  <span className="muted small">Key ending …{keys[p.id]!.slice(-4)}</span>
+                  <button className="link" style={{ padding: 0 }} onClick={() => remove(p.id)}>Remove</button>
+                </div>
+              ) : (
+                <div className="fk-actions">
+                  <button className="ghost small" onClick={() => window.open(p.url, `key-${p.id}`, "width=980,height=760")}>
+                    1 · Get free key ↗
+                  </button>
+                  <button className="connect small" disabled={busy === p.id} onClick={() => paste(p.id)}>
+                    {busy === p.id ? "Checking…" : "2 · Paste key"}
+                  </button>
+                </div>
+              )}
+              {!on && <div className="muted small fk-hint">On the {p.name} page: sign in → {p.hint}, then come back and press Paste.</div>}
+              {showManual[p.id] && !on && (
+                <div className="row" style={{ marginTop: 8 }}>
+                  <input type="password" autoFocus placeholder={`${p.name} API key`} value={manual[p.id] || ""} onChange={(e) => setManual((v) => ({ ...v, [p.id]: e.target.value }))} onKeyDown={(e) => e.key === "Enter" && save(p.id, manual[p.id] || "")} />
+                  <button className="ghost" disabled={(manual[p.id] || "").length < 20 || busy === p.id} onClick={() => save(p.id, manual[p.id] || "")}>Save</button>
+                </div>
+              )}
+              {m && <div className={`small fk-msg ${m.ok ? "ok" : "err"}`}>{m.text}</div>}
+            </div>
+          );
+        })}
       </div>
     </div>
   );

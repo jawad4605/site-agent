@@ -29,15 +29,31 @@ type Provider = {
   extra?: Record<string, unknown>;
   headers?: Record<string, string>;
   maxTokens?: number;
+  // Tokens-per-minute limit of this key (Groq free: 8,000). When set and small, requests are
+  // squeezed to fit: short instructions, recent history only, the page in focus only, no screenshots.
+  tpm?: number;
 };
+
+const LEAN_UNDER = 40_000; // budgets below this use lean mode
 
 export const DEFAULT_MODELS = {
   claude: "claude-sonnet-5-5",
   openai: "gpt-6.2-sol",
   gemini: "gemini-3.5-flash",
-  groq: "qwen/qwen3.8-27b",
+  groq: "openai/gpt-oss-120b",
   openrouter: "anthropic/claude-sonnet-5.5",
 };
+
+// Groq chat models that can call tools. Each has its own free budget (30 requests/min, 8K tokens/min,
+// 200K tokens/day), so the agent rotates through all of them. Override with GROQ_MODELS.
+const GROQ_MODELS = [
+  ...new Set(
+    (process.env.GROQ_MODELS ?? `${process.env.GROQ_MODEL || "openai/gpt-oss-120b"},qwen/qwen3.8-27b,openai/gpt-oss-20b`)
+      .split(",")
+      .map((m) => m.trim())
+      .filter(Boolean),
+  ),
+];
 
 const OPENROUTER_BACKUPS = ["anthropic/claude-sonnet-5.5", "openai/gpt-6.2-sol", "google/gemini-3.5-flash"];
 
@@ -69,21 +85,15 @@ const PRESETS = {
     extra: { reasoning_effort: "low" },
   }),
   groq: (key: string, model?: string): Provider => ({
+    // Groq: very fast. Free plan per model: 30 requests/min, 8K tokens/min, 200K tokens/day,
+    // so requests are squeezed into the token budget (lean mode). Developer plan: set GROQ_TPM=250000.
     name: "Groq",
     url: "https://api.groq.com/openai/v1",
     key,
-    model: model || DEFAULT_MODELS.groq, // best Groq model that can SEE + use tools
-    vision: !/gpt-oss|llama-3/.test(model || ""),
-    extra: { reasoning_format: "hidden" },
-  }),
-  groqText: (key: string): Provider => ({
-    // backup on Groq: strongest production model, text-only (gets QA findings instead of screenshots)
-    name: "Groq",
-    url: "https://api.groq.com/openai/v1",
-    key,
-    model: process.env.GROQ_TEXT_MODEL || "openai/gpt-oss-120b",
+    model: model || DEFAULT_MODELS.groq,
     vision: false,
-    extra: { reasoning_effort: "medium" },
+    tpm: Number(process.env.GROQ_TPM || 8000),
+    extra: /gpt-oss/.test(model || "") ? { reasoning_effort: "low" } : { reasoning_format: "hidden" },
   }),
 };
 
@@ -93,12 +103,15 @@ function serverProviders(): Provider[] {
   if (e.OPENAI_API_KEY) list.push(PRESETS.openai(e.OPENAI_API_KEY, e.OPENAI_MODEL));
   if (e.GEMINI_API_KEY) {
     // Each Gemini model has its OWN free quota, so when one is used up we try the next.
-    const models = [e.GEMINI_MODEL || DEFAULT_MODELS.gemini, ...(e.GEMINI_FALLBACK_MODELS ?? "gemini-2.5-flash,gemini-3.1-flash-lite,gemini-2.5-flash-lite").split(",")]
+    const models = [e.GEMINI_MODEL || DEFAULT_MODELS.gemini, ...(e.GEMINI_FALLBACK_MODELS ?? "gemini-3.1-flash-lite").split(",")]
       .map((m) => m.trim())
       .filter((m, i, all) => m && all.indexOf(m) === i);
     for (const m of models) list.push(PRESETS.gemini(e.GEMINI_API_KEY, m));
   }
-  if (e.GROQ_API_KEY) list.push(PRESETS.groq(e.GROQ_API_KEY, e.GROQ_MODEL), PRESETS.groqText(e.GROQ_API_KEY));
+  if (e.GROQ_API_KEY) {
+    // Each Groq model has its OWN per-minute and per-day budget, so spreading work across them multiplies capacity.
+    for (const m of GROQ_MODELS) list.push(PRESETS.groq(e.GROQ_API_KEY, m));
+  }
   if (e.FALLBACK_API_KEY && e.FALLBACK_BASE_URL && e.FALLBACK_MODEL)
     list.push({
       name: "Custom",
@@ -118,7 +131,8 @@ function skipFor(err: any): number {
   const msg = String(err?.message ?? err);
   if (/per ?day|daily|PerDay/i.test(msg)) return 60 * 60_000;
   if (/\b(401|403)\b|invalid.*key|unauthori[sz]ed|permission/i.test(msg)) return 60 * 60_000;
-  if (/\b(413)\b|too large/i.test(msg)) return 60_000;
+  if (/does not fit/i.test(msg)) return 0; // only THIS request is too big; the next, smaller one may fit
+  if (/\b(413)\b|too large|tokens per minute|TPM/i.test(msg)) return 60_000;
   if (/\b429\b|quota|rate/i.test(msg)) return 45_000;
   return 2 * 60_000;
 }
@@ -138,38 +152,51 @@ export async function callModel(
   tools: Anthropic.Tool[],
   messages: Anthropic.MessageParam[],
   files: Record<string, string> = {},
-  brain?: Brain,
+  brainOrBrains?: Brain | Brain[], // every key the user connected, tried in order before the server's keys
+  leanSystem?: string, // short version of the instructions for small token budgets
 ): Promise<ModelResult> {
   // Build the ordered list of things to try
   type Attempt = { id: string; label: string; run: () => Promise<Block[]> };
   const attempts: Attempt[] = [];
+  const brains = (Array.isArray(brainOrBrains) ? brainOrBrains : brainOrBrains ? [brainOrBrains] : []).filter((b) => b?.key);
 
-  if (brain?.key) {
+  for (const brain of brains) {
     const id = `user-${brain.provider}-${brain.key.slice(-6)}`;
     if (brain.provider === "claude") {
       const model = brain.model || DEFAULT_MODELS.claude;
       attempts.push({ id, label: `Claude · ${model} (your key)`, run: () => callClaude(brain.key, model, system, tools, messages) });
     } else {
       const p = PRESETS[brain.provider](brain.key, brain.model);
-      attempts.push({ id, label: `${p.name} · ${p.model}`, run: () => callOpenAICompatible(p, system, tools, messages, files) });
+      attempts.push({ id, label: `${p.name} · ${p.model}${brain.provider === "openrouter" ? "" : " (your key)"}`, run: () => callOpenAICompatible(p, system, tools, messages, files, leanSystem) });
+      // A student's own Groq or Gemini key: use EVERY free model on that key (each has its own
+      // per-minute and per-day budget) before touching the server's shared keys.
+      const sameKeyModels =
+        brain.provider === "groq" ? GROQ_MODELS : brain.provider === "gemini" ? [DEFAULT_MODELS.gemini, "gemini-3.1-flash-lite"] : [];
+      for (const m of sameKeyModels.filter((x) => x !== p.model)) {
+        const q = PRESETS[brain.provider as "groq" | "gemini"](brain.key, m);
+        attempts.push({ id: `${id}-${m}`, label: `${q.name} · ${m} (your key)`, run: () => callOpenAICompatible(q, system, tools, messages, files, leanSystem) });
+      }
       // OpenRouter: if the chosen model fails, try the other big models on the same account first
       if (brain.provider === "openrouter") {
         for (const m of OPENROUTER_BACKUPS.filter((x) => x !== p.model)) {
           const q = PRESETS.openrouter(brain.key, m);
-          attempts.push({ id: `${id}-${m}`, label: `OpenRouter · ${m}`, run: () => callOpenAICompatible(q, system, tools, messages, files) });
+          attempts.push({ id: `${id}-${m}`, label: `OpenRouter · ${m}`, run: () => callOpenAICompatible(q, system, tools, messages, files, leanSystem) });
         }
       }
     }
   }
-  if (process.env.ANTHROPIC_API_KEY) {
+  // The server's own keys are ONLY for people who haven't connected a key of their own.
+  // Anyone with their own key never uses (or uses up) the server's limits.
+  const serverKeys = brains.length === 0;
+  if (serverKeys && process.env.ANTHROPIC_API_KEY) {
     const model = process.env.ANTHROPIC_MODEL || DEFAULT_MODELS.claude;
     attempts.push({ id: "claude", label: `Claude · ${model}`, run: () => callClaude(process.env.ANTHROPIC_API_KEY!, model, system, tools, messages) });
   }
-  for (const p of serverProviders()) {
+  for (const p of serverKeys ? serverProviders() : []) {
     attempts.push({
       id: `${p.name}-${p.model}`,
       label: `${p.name} · ${p.model}${p.vision === false ? " (text-only)" : ""}`,
-      run: () => callOpenAICompatible(p, system, tools, messages, files),
+      run: () => callOpenAICompatible(p, system, tools, messages, files, leanSystem),
     });
   }
   if (!attempts.length) throw new Error("No AI model connected. Add a key in ⚙️ Connections, or set one in .env.local.");
@@ -196,7 +223,9 @@ export async function callModel(
   const quota = problems.some((x) => /429|quota|rate|too large|413/i.test(x));
   throw new Error(
     quota
-      ? `The free AI models are at their limit right now (${problems.length} tried). Wait about a minute and the agent retries automatically, or connect another model in Connections. Details: ${problems.join(" | ")}`
+      ? brains.length
+        ? `Your free keys are at their limit right now (${problems.length} models tried). Wait about a minute and the agent retries automatically, or add your other free key (Groq or Gemini) in Connections. Details: ${problems.join(" | ")}`
+        : `The free AI models are at their limit right now (${problems.length} tried). Wait about a minute and the agent retries automatically, or connect your own free key in Connections. Details: ${problems.join(" | ")}`
       : `All models failed. ${problems.join(" | ")}`,
   );
 }
@@ -208,12 +237,16 @@ async function callOpenAICompatible(
   tools: Anthropic.Tool[],
   messages: Anthropic.MessageParam[],
   files: Record<string, string>,
+  leanSystem?: string,
 ) {
+  // LEAN_MODE=1 keeps requests small even on a paid plan, so many more students fit in the same per-minute budget
+  const lean = !!p.tpm && (p.tpm < LEAN_UNDER || process.env.LEAN_MODE === "1");
+  if (lean) ({ system, tools, messages, files } = squeeze(system, leanSystem, tools, messages, files));
   const history = toOpenAI(messages, p.vision !== false, files);
   if (p.name === "Gemini" || /gemini/i.test(p.model)) addGeminiSignatures(history);
   const body = {
     model: p.model,
-    [p.tokenParam ?? "max_tokens"]: Number(process.env.FALLBACK_MAX_TOKENS || p.maxTokens || 16000),
+    [p.tokenParam ?? "max_tokens"]: lean ? 0 : Number(process.env.FALLBACK_MAX_TOKENS || p.maxTokens || 16000),
     messages: [{ role: "system", content: system }, ...history],
     ...(tools.length
       ? {
@@ -226,6 +259,13 @@ async function callOpenAICompatible(
       : {}),
     ...p.extra,
   };
+  if (lean) {
+    // The provider counts input + requested output against the per-minute budget.
+    const input = estimateTokens(body);
+    const room = p.tpm! - input - 300;
+    if (room < 1200) throw new Error(`request does not fit ${p.name}'s ${p.tpm} tokens/min (≈${input} tokens needed)`);
+    (body as any)[p.tokenParam ?? "max_tokens"] = Math.min(room, 12000);
+  }
 
   let res: Response | null = null;
   for (let attempt = 0; attempt < 3; attempt++) {
@@ -269,6 +309,41 @@ async function callOpenAICompatible(
   }
   if (blocks.length === 0) blocks.push({ type: "text", text: `(no response${choice.finish_reason ? ": " + choice.finish_reason : ""})` });
   return blocks;
+}
+
+// ── Lean mode: fit a request into a small tokens-per-minute budget ──
+const estimateTokens = (x: unknown) => Math.ceil(JSON.stringify(x).length / 3.6);
+
+function squeeze(system: string, leanSystem: string | undefined, tools: Anthropic.Tool[], messages: Anthropic.MessageParam[], files: Record<string, string>) {
+  // 1. short instructions and one-line tool descriptions
+  const shortTools = tools.map((t) => ({ ...t, description: String(t.description).split(/(?<=\.)\s/)[0] }));
+  // 2. the original request + only the latest steps (cut before an assistant turn so tool results stay paired)
+  const first = messages[0];
+  let start = Math.max(1, messages.length - 4);
+  while (start < messages.length && messages[start].role !== "assistant") start--;
+  if (start < 1) start = 1;
+  const recent = messages.slice(start).map((m) =>
+    Array.isArray(m.content)
+      ? {
+          ...m,
+          content: (m.content as any[]).map((b) =>
+            b.type === "tool_result" && Array.isArray(b.content)
+              ? { ...b, content: b.content.filter((c: any) => c.type !== "image").map((c: any) => (c.type === "text" ? { ...c, text: String(c.text).slice(0, 1500) } : c)) }
+              : b,
+          ),
+        }
+      : m,
+  );
+  const skipped = start > 1 ? [{ role: "user" as const, content: `(${start - 1} earlier steps omitted to save tokens. Pages so far: ${Object.keys(files).join(", ") || "none"}.)` }] : [];
+  // keep roles alternating: the note merges into the request when needed
+  const head: Anthropic.MessageParam[] = skipped.length && typeof first.content === "string" ? [{ role: "user", content: first.content + "\n\n" + skipped[0].content }] : [first];
+  // 3. only the page being worked on is sent in full
+  const lastText = JSON.stringify(messages.slice(-3));
+  const focus = Object.keys(files).filter((n) => lastText.includes(n));
+  const keep = focus.length ? focus.slice(-1) : Object.keys(files).slice(0, 1);
+  const slim: Record<string, string> = {};
+  for (const n of keep) slim[n] = files[n];
+  return { system: leanSystem || system, tools: shortTools, messages: [...head, ...recent], files: slim };
 }
 
 // Anthropic message history → OpenAI message list

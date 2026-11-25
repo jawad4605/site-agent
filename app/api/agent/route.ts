@@ -10,7 +10,7 @@ export const dynamic = "force-dynamic";
 
 export async function POST(req: Request) {
   try {
-    const { messages, files, siteId, brain: picked, style } = await req.json();
+    const { messages, files, siteId, brain: picked, brains: extra, style } = await req.json();
     // New site: give the agent a concrete art direction so every site looks different
     let direction: string | undefined;
     if (Array.isArray(messages) && messages.length === 1 && typeof messages[0]?.content === "string" && !messages[0].content.includes("ART DIRECTION")) {
@@ -27,11 +27,20 @@ export async function POST(req: Request) {
     if (!Array.isArray(messages) || messages.length === 0 || messages.length > 200) {
       return Response.json({ error: "Invalid conversation" }, { status: 400 });
     }
-    if (!hasAnyModel() && !brain?.key && !process.env.MOCK_LLM) {
+    // Free keys the student connected (Groq, Gemini): used after the picked model, before the server's keys
+    const own = (Array.isArray(extra) ? extra : [])
+      .filter((b: any) => ["groq", "gemini", "claude", "openai"].includes(b?.provider) && typeof b?.key === "string" && b.key.length > 10)
+      .slice(0, 6);
+    const all = [...(brain?.key ? [brain] : []), ...own];
+    // REQUIRE_OWN_KEY=1 (e.g. during a live session): everyone must connect their own free key; the server's keys are never used
+    if (process.env.REQUIRE_OWN_KEY === "1" && !all.length && !process.env.MOCK_LLM) {
+      return Response.json({ error: "Connect your own free AI key first: open ⚙️ Connections → Free AI keys → Groq (takes 1 minute)." }, { status: 400 });
+    }
+    if (!hasAnyModel() && !all.length && !process.env.MOCK_LLM) {
       return Response.json({ error: "No AI model connected. Open ⚙️ Connections and add a key (Gemini and Groq are free), or set one in the environment variables." }, { status: 500 });
     }
     const origin = new URL(req.url).origin;
-    const result = await runStep({ messages, files: files ?? {}, siteId, origin, brain: brain?.key ? brain : undefined });
+    const result = await runStep({ messages, files: files ?? {}, siteId, origin, brain: all.length ? all : undefined });
     if (direction) result.events.unshift({ type: "direction", name: direction });
     return Response.json(result);
   } catch (err: any) {

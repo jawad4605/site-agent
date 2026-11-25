@@ -26,6 +26,6 @@ export const PROVIDERS: { id: ProviderId; name: string; model: string; link: str
   { id: "claude", name: "Claude", model: "claude-sonnet-5-5", link: "https://console.anthropic.com/settings/keys" },
   { id: "openai", name: "ChatGPT (OpenAI)", model: "gpt-6.2-sol", link: "https://platform.openai.com/api-keys" },
   { id: "gemini", name: "Gemini (free tier)", model: "gemini-3.5-flash", link: "https://aistudio.google.com/apikey" },
-  { id: "groq", name: "Groq (free tier)", model: "qwen/qwen3.8-27b", link: "https://console.groq.com/keys" },
+  { id: "groq", name: "Groq (free tier)", model: "openai/gpt-oss-120b", link: "https://console.groq.com/keys" },
 ];
 export type Img = { url: string; name: string };
